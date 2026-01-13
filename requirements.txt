@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+google-generativeai
+google-auth
+google-api-python-client
+httpx
+pydantic
+python-multipart
+python-dotenv
