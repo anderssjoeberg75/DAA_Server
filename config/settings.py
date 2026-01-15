@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from a .env file if it exists
+load_dotenv()
 
 """
 ==============================================================================
@@ -8,10 +12,7 @@ PROJECT: DAA Digital Advanced Assistant
 
 DESCRIPTION:
     Central configuration file. Contains API keys, server settings, and paths.
-    
-    SECURITY NOTE: 
-    Do not upload this file to GitHub if it contains real API keys.
-    Ensure 'config/settings.py' is in your .gitignore file.
+    Now includes MQTT configuration for Home Automation.
 """
 
 # ==============================================================================
@@ -19,56 +20,53 @@ DESCRIPTION:
 # ==============================================================================
 
 APP_NAME = "DAA Digital Advanced Assistant"
-VERSION = "2.0 (Python Core)"
-DEBUG_MODE = True  # Useful for seeing errors during development
+VERSION = "2.2 (Server Intelligence)"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "True").lower() == "true"
 
 # ==============================================================================
 # 2. SERVER CONFIGURATION
 # ==============================================================================
 
 HOST = "0.0.0.0"
-# We use 3500 to match your old Node.js setup
-PORT = 3500 
+PORT = int(os.getenv("PORT", 3500))
 
 # ==============================================================================
 # 3. API KEYS & CREDENTIALS
 # ==============================================================================
 
-# Google API Key:
-# Insert your real Google Cloud/Gemini API key here.
-GOOGLE_API_KEY = "DIN_GOOGLE_API_KEY_HÄR" 
+# Google Gemini API Key
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# Service Account for Google Calendar
+# Ensure this file is present in your root directory
+SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
 
 # ==============================================================================
 # 4. EXTERNAL SERVICES (LOCAL AI)
 # ==============================================================================
 
-# Configuration for Ollama (Local LLM)
-OLLAMA_URL = "http://127.0.0.1:11434"
-# You can define a default model here if you want (e.g., "llama3" or "mistral")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_DEFAULT_MODEL = "llama3"
 
 # ==============================================================================
-# 5. FILE PATHS & DIRECTORIES
+# 5. MQTT / IOT CONFIGURATION (ZIGBEE2MQTT)
 # ==============================================================================
 
-# Base Directory:
-# Calculates the absolute path to the project root (DAA-Digital-Advanced-Assistant/)
+# IP address of your MQTT Broker (e.g., Home Assistant or Mosquitto)
+MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP", "192.168.107.6") 
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
+MQTT_TOPIC_BASE = "zigbee2mqtt"
+
+# ==============================================================================
+# 6. FILE PATHS & DIRECTORIES
+# ==============================================================================
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Log Directory:
-LOG_DIR_NAME = "logs"
-LOG_FILENAME = "daa_memory.db" # Or daa.log, depending on usage
-
-# Full Paths:
-# We construct full paths using os.path.join for cross-platform compatibility
-LOG_PATH = os.path.join(BASE_DIR, LOG_DIR_NAME)
-DB_PATH = os.path.join(LOG_PATH, LOG_FILENAME)
-
-# Note: We do not create directories here. 
-# The directory creation is handled in app/utils/logger.py or main.py.
+LOG_PATH = os.path.join(BASE_DIR, "logs")
+DB_PATH = os.path.join(LOG_PATH, "daa_memory.db")
 
 # ==============================================================================
-# 6. CONFIGURATION EXPORT
+# 7. CONFIGURATION EXPORT
 # ==============================================================================
 
 def get_config():
@@ -82,8 +80,12 @@ def get_config():
         "HOST": HOST,
         "PORT": PORT,
         "GOOGLE_API_KEY": GOOGLE_API_KEY,
+        "SERVICE_ACCOUNT_FILE": SERVICE_ACCOUNT_FILE,
         "OLLAMA_URL": OLLAMA_URL,
         "OLLAMA_DEFAULT_MODEL": OLLAMA_DEFAULT_MODEL,
+        "MQTT_BROKER_IP": MQTT_BROKER_IP,
+        "MQTT_PORT": MQTT_PORT,
+        "MQTT_TOPIC_BASE": MQTT_TOPIC_BASE,
         "BASE_DIR": BASE_DIR,
         "LOG_DIR": LOG_PATH,
         "DB_PATH": DB_PATH

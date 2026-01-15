@@ -1,0 +1,8 @@
+"""
+app/tools/__init__.py
+---------------------
+Exposes external tools and API integrations.
+"""
+
+from .gcal_core import create_calendar_event, get_calendar_service
+from .z2m_core import get_sensor_data
