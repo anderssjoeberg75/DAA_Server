@@ -1,114 +1,215 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 import google.generativeai as genai
+import requests
+import json
 import time
 from typing import List, Optional
 
-# Vi importerar inställningar och verktyg
-from app.tools.garmin_core import GarminCoach
-from config.settings import GARMIN_EMAIL, GARMIN_PASSWORD
+# --- HÄR KOPPLAR VI IHOP MED DIN SETTINGS.PY ---
+try:
+    from config.settings import (
+        GOOGLE_API_KEY, 
+        OPENAI_API_KEY, 
+        OLLAMA_URL, 
+        GARMIN_EMAIL, 
+        GARMIN_PASSWORD
+    )
+except ImportError:
+    print(">> VARNING: Kunde inte importera från config.settings")
+    GOOGLE_API_KEY = None
+    OPENAI_API_KEY = None
+    OLLAMA_URL = "http://127.0.0.1:11434"
+    GARMIN_EMAIL = None
+    GARMIN_PASSWORD = None
 
-# Om du har din API-nyckel i settings.py, importera den här.
-# Annars, lägg in den direkt nedan som sträng.
-# from config.settings import GEMINI_API_KEY 
-API_KEY = "DIN_GEMINI_API_KEY_HÄR"  # <--- SE TILL ATT DENNA ÄR RÄTT!
+from app.tools.garmin_core import GarminCoach
 
 router = APIRouter()
 
-# --- KONFIGURERA GEMINI ---
-genai.configure(api_key=API_KEY)
+# --- KONFIGURATION AV AI-TJÄNSTER ---
+has_google = False
+if GOOGLE_API_KEY and len(str(GOOGLE_API_KEY)) > 10:
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        has_google = True
+        print(">> Google API konfigurerat.")
+    except Exception as e:
+        print(f">> Google API Error: {e}")
+else:
+    print(">> VARNING: Ingen giltig Google API-nyckel hittades.")
+
+# --- INITIERA VERKTYG (GARMIN) ---
+garmin_tool = None
+if GARMIN_EMAIL and GARMIN_PASSWORD:
+    try:
+        garmin_tool = GarminCoach()
+        print(">> Garmin-verktyg initierat.")
+    except Exception as e:
+        print(f">> Kunde inte starta Garmin: {e}")
+
+last_garmin_fetch = 0
+cached_garmin_data = None
 
 # --- DATAMODELLER ---
 class Message(BaseModel):
     role: str
     content: str
+    image: Optional[str] = None
 
 class ChatRequest(BaseModel):
     model: str = "gemini-1.5-flash"
     messages: List[Message]
     session_id: Optional[str] = None
 
-# --- INITIERA VERKTYG ---
-garmin_tool = GarminCoach()
-last_garmin_fetch = 0
-cached_garmin_data = None
-
-# --- NY ENDPOINT: LISTA MODELLER (Löser 404-felet) ---
+# --- HÄMTA MODELLER ---
 @router.get("/api/models")
 async def get_models():
-    """Berättar för agenten vilka modeller som finns."""
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": "gemini-1.5-flash",
-                "object": "model",
-                "created": 1686935002,
-                "owned_by": "google"
-            }
-        ]
-    }
+    models = []
+    
+    # 1. Google Gemini
+    if has_google:
+        print(">> Hämtar Google-modeller från API...")
+        try:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    clean_id = m.name.replace("models/", "")
+                    d_name = getattr(m, "display_name", getattr(m, "displayName", clean_id))
+                    models.append({
+                        "id": clean_id, 
+                        "name": f"Google: {d_name} ({clean_id})"
+                    })
+        except Exception as e:
+            print(f">> Fel vid listning av Google-modeller: {e}")
+            models.append({"id": "gemini-1.5-flash", "name": "Google: Gemini 1.5 Flash (Fallback)"})
+    
+    # 2. OpenAI
+    if OPENAI_API_KEY:
+        print(">> Hämtar OpenAI-modeller från API...")
+        try:
+            h = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            r = requests.get("https://api.openai.com/v1/models", headers=h, timeout=5)
+            if r.status_code == 200:
+                data = r.json().get('data', [])
+                data.sort(key=lambda x: x.get('created', 0), reverse=True)
+                for m in data:
+                    mid = m['id']
+                    if "gpt" in mid or "o1" in mid:
+                        models.append({"id": mid, "name": f"OpenAI: {mid}"})
+        except Exception as e:
+            print(f">> OpenAI Error: {e}")
 
-# --- CHAT ENDPOINT ---
-# Vi lägger till både /chat och /api/chat för säkerhets skull
+    # 3. Ollama
+    print(">> Hämtar Ollama-modeller...")
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        if r.status_code == 200:
+            for m in r.json().get('models', []):
+                models.append({"id": m['name'], "name": f"Ollama: {m['name']}"})
+    except Exception as e:
+        print(f">> Kunde inte nå Ollama: {e}")
+
+    if not models:
+        models.append({"id": "error", "name": "Inga modeller hittades (Kolla loggen)"})
+
+    return {"object": "list", "data": models}
+
+# --- CHATT-LOGIK ---
 @router.post("/chat")
 @router.post("/api/chat")
 async def chat(request: ChatRequest):
     global last_garmin_fetch, cached_garmin_data
     
-    user_input = request.messages[-1].content.lower()
+    user_msg = request.messages[-1].content
+    model_id = request.model.lower()
     
-    # 1. Definiera system-prompten
-    system_context = (
-        "Du är DAA (Digital Advanced Assistant). Du är smart, hjälpsam och koncis. "
-        "Svara alltid på svenska."
-    )
+    system_prompt = "Du är DAA, en smart assistent. Svara på svenska."
 
-    # 2. Kolla om vi behöver Garmin-data
-    trigger_words = ["träning", "hälsa", "sömn", "puls", "springa", "mår jag", "garmin", "tips", "trött", "pigg", "status"]
-    should_fetch_health = any(word in user_input for word in trigger_words)
-
-    if should_fetch_health:
-        print(">> Trigger upptäckt: Försöker hämta hälsodata...")
-        
-        # Caching: Hämta max var 15:e minut
+    # --- GARMIN-DATA ---
+    triggers = ["puls", "sömn", "träning", "stress", "garmin", "mår jag", "status"]
+    if garmin_tool and any(t in user_msg.lower() for t in triggers):
         now = time.time()
-        if (now - last_garmin_fetch > 900) or (cached_garmin_data is None):
-            data = garmin_tool.get_health_report()
-            if data:
-                cached_garmin_data = data
-                last_garmin_fetch = now
-                print(">> Garmin-data hämtad.")
-            else:
-                print(">> Kunde inte hämta Garmin-data.")
+        if (now - last_garmin_fetch > 900) or not cached_garmin_data:
+            print(">> Hämtar Garmin-data...")
+            try:
+                report = garmin_tool.get_health_report()
+                if report:
+                    cached_garmin_data = report
+                    last_garmin_fetch = now
+            except Exception as e:
+                print(f">> Garmin Fetch Error: {e}")
         
-        # Lägg till datan i system-prompten
         if cached_garmin_data:
-            stats = cached_garmin_data
-            health_prompt = (
-                f"\n\n[HÄLSODATA FRÅN GARMIN - {stats['datum']}]:\n"
-                f"- Sömn: {stats['sömn_timmar']} timmar.\n"
-                f"- Vilopuls: {stats['vilopuls']} bpm.\n"
-                f"- Stressnivå (snitt): {stats['stress_snitt']}.\n"
-                f"- Steg idag: {stats['steg']}.\n"
-                f"- Senaste aktivitet: {stats['senaste_träning']}.\n"
-                f"Analysera datan. Ge korta, konkreta råd baserat på dagsformen."
+            d = cached_garmin_data
+            
+            data_block = (
+                f"Sömn: {d.get('sömn_timmar')}h\n"
+                f"Vilopuls: {d.get('vilopuls')} bpm\n"
+                f"Stress: {d.get('stress_snitt')}/100\n"
+                f"Steg: {d.get('steg')}"
             )
-            system_context += health_prompt
 
-    # 3. Bygg meddelandelistan till Gemini
-    gemini_messages = [{"role": "user", "parts": [system_context]}]
-    
-    for m in request.messages:
-        role = "user" if m.role == "user" else "model"
-        gemini_messages.append({"role": role, "parts": [m.content]})
+            # NY PROMPT: Långt svar, ren text, tydliga radbrytningar
+            system_prompt += (
+                f"\n\n[HÄLSODATA FRÅN GARMIN]\n"
+                f"{data_block}\n\n"
+                "INSTRUKTION FÖR RAPPORTEN:\n"
+                "Du ska agera som en professionell hälsocoach. Ge en utförlig, djupgående och omtänksam analys.\n"
+                "VIKTIGT OM FORMATERING:\n"
+                "1. Använd INTE Markdown-rubriker (###) eller fetstil (**text**). Skriv bara ren text.\n"
+                "2. Använd punktlistor (*) för mätvärdena så att de hamnar på nya rader.\n"
+                "3. Använd dubbla radbrytningar mellan stycken för att skapa luft i texten.\n\n"
+                "Följ denna struktur:\n"
+                "DAGENS STATUS\n"
+                "* (Lista värdena med emojis, en per rad)\n\n"
+                "ANALYS\n"
+                "(Skriv en lång och detaljerad analys i flera stycken om hur värdena hänger ihop. Förklara varför sömnen är viktig om den är låg.)\n\n"
+                "RÅD\n"
+                "1. (Konkret råd 1)\n"
+                "2. (Konkret råd 2)\n"
+                "3. (Konkret råd 3)"
+            )
 
-    # 4. Anropa Gemini
-    try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(gemini_messages)
-        return response.text
+    # --- ROUTING ---
+    if "gemini" in model_id:
+        try:
+            msgs = [{"role": "user", "parts": [system_prompt]}]
+            for m in request.messages:
+                role = "user" if m.role == "user" else "model"
+                msgs.append({"role": role, "parts": [m.content]})
+            gmodel = genai.GenerativeModel(model_id)
+            return gmodel.generate_content(msgs).text
+        except Exception as e:
+            return f"Gemini Error: {e}"
 
-    except Exception as e:
-        print(f"Gemini Error: {e}")
-        return "Jag har lite problem med anslutningen till hjärnan just nu."
+    elif "gpt" in model_id or "o1" in model_id:
+        try:
+            payload = {
+                "model": model_id,
+                "messages": [{"role": "system", "content": system_prompt}] + 
+                            [{"role": m.role, "content": m.content} for m in request.messages]
+            }
+            h = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            r = requests.post("https://api.openai.com/v1/chat/completions", json=payload, headers=h)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+            else:
+                return f"OpenAI Error {r.status_code}: {r.text}"
+        except Exception as e:
+            return f"OpenAI Connection Error: {e}"
+
+    else:
+        try:
+            payload = {
+                "model": model_id,
+                "messages": [{"role": "system", "content": system_prompt}] + 
+                            [{"role": m.role, "content": m.content} for m in request.messages],
+                "stream": False
+            }
+            r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=60)
+            if r.status_code == 200:
+                return r.json().get("message", {}).get("content", "")
+            else:
+                return f"Ollama Error: {r.text}"
+        except Exception as e:
+            return f"Ollama Connection Failed: {e}"
