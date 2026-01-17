@@ -1,5 +1,6 @@
 import sqlite3
-from config.settings import DB_PATH
+# Importera HISTORY_LIMIT här:
+from config.settings import DB_PATH, HISTORY_LIMIT
 import os
 
 def init_db():
@@ -28,10 +29,13 @@ def save_message(session_id, role, content, image=None):
     conn.commit()
     conn.close()
 
-def get_history(session_id, limit=60):
+# Använd HISTORY_LIMIT som default-värde
+def get_history(session_id, limit=HISTORY_LIMIT):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
+    
+    # Hämtar de senaste 'limit' raderna
     c.execute(f"SELECT role, content, image FROM (SELECT * FROM history WHERE session_id = ? ORDER BY id DESC LIMIT {limit}) ORDER BY id ASC", (session_id,))
     rows = c.fetchall()
     conn.close()

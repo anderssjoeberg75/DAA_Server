@@ -7,3 +7,6 @@ httpx
 pydantic
 python-multipart
 paho-mqtt
+python-dotenv
+openai
+anthropic

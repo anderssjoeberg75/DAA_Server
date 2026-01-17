@@ -1,88 +1,114 @@
-from fastapi import APIRouter
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
-import httpx
 import google.generativeai as genai
+import time
+from typing import List, Optional
 
-from app.core.database import save_message, get_history
-from app.services.llm_handler import stream_gemini, stream_ollama
-from config.settings import get_config
+# Vi importerar inställningar och verktyg
+from app.tools.garmin_core import GarminCoach
+from config.settings import GARMIN_EMAIL, GARMIN_PASSWORD
+
+# Om du har din API-nyckel i settings.py, importera den här.
+# Annars, lägg in den direkt nedan som sträng.
+# from config.settings import GEMINI_API_KEY 
+API_KEY = "DIN_GEMINI_API_KEY_HÄR"  # <--- SE TILL ATT DENNA ÄR RÄTT!
 
 router = APIRouter()
-cfg = get_config()
 
-# Konfigurera Gemini globalt för att kunna lista modeller
-if cfg["GOOGLE_API_KEY"]:
-    genai.configure(api_key=cfg["GOOGLE_API_KEY"])
+# --- KONFIGURERA GEMINI ---
+genai.configure(api_key=API_KEY)
 
-# --- Request Model ---
+# --- DATAMODELLER ---
+class Message(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
-    model: str
-    messages: List[dict]
-    session_id: str = "default"
+    model: str = "gemini-1.5-flash"
+    messages: List[Message]
+    session_id: Optional[str] = None
 
-# --- Endpoints ---
+# --- INITIERA VERKTYG ---
+garmin_tool = GarminCoach()
+last_garmin_fetch = 0
+cached_garmin_data = None
 
+# --- NY ENDPOINT: LISTA MODELLER (Löser 404-felet) ---
 @router.get("/api/models")
 async def get_models():
-    """Hämtar tillgängliga modeller dynamiskt."""
-    models = []
-    
-    # 1. Hämta från Ollama
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{cfg['OLLAMA_URL']}/api/tags", timeout=2.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                for m in data.get('models', []):
-                    models.append({
-                        "id": m['name'], 
-                        "name": f"🏠 Ollama: {m['name']}"
-                    })
-    except Exception as e:
-        print(f"Ollama connection failed: {e}")
+    """Berättar för agenten vilka modeller som finns."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "gemini-1.5-flash",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "google"
+            }
+        ]
+    }
 
-    # 2. Hämta från Google Gemini
-    if cfg["GOOGLE_API_KEY"]:
-        try:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    # Skapa ett snyggt namn
-                    friendly = m.display_name if hasattr(m, "display_name") else m.name
-                    models.append({"id": m.name, "name": f"☁️ {friendly}"})
-        except Exception as e:
-            print(f"Gemini API Error: {e}")
-        
-    return JSONResponse(content=models)
-
+# --- CHAT ENDPOINT ---
+# Vi lägger till både /chat och /api/chat för säkerhets skull
+@router.post("/chat")
 @router.post("/api/chat")
-async def chat_endpoint(req: ChatRequest):
-    """Chatt-endpoint med stöd för streaming och historik."""
+async def chat(request: ChatRequest):
+    global last_garmin_fetch, cached_garmin_data
     
-    last_msg = req.messages[-1]
-    user_text = last_msg.get("content", "")
-    user_image = last_msg.get("image", None)
+    user_input = request.messages[-1].content.lower()
     
-    # Spara användarens meddelande
-    save_message(req.session_id, "user", user_text, user_image)
-    
-    history = get_history(req.session_id)
-    
-    # Välj generator baserat på modellnamn
-    if "gemini" in req.model.lower() or "models/" in req.model.lower():
-        generator = stream_gemini(req.model, history, user_text, user_image)
-    else:
-        generator = stream_ollama(req.model, history, user_text)
+    # 1. Definiera system-prompten
+    system_context = (
+        "Du är DAA (Digital Advanced Assistant). Du är smart, hjälpsam och koncis. "
+        "Svara alltid på svenska."
+    )
 
-    # Strömma svaret och spara det
-    async def response_wrapper():
-        full_response = ""
-        async for chunk in generator:
-            full_response += chunk
-            yield chunk
+    # 2. Kolla om vi behöver Garmin-data
+    trigger_words = ["träning", "hälsa", "sömn", "puls", "springa", "mår jag", "garmin", "tips", "trött", "pigg", "status"]
+    should_fetch_health = any(word in user_input for word in trigger_words)
+
+    if should_fetch_health:
+        print(">> Trigger upptäckt: Försöker hämta hälsodata...")
         
-        if full_response:
-            save_message(req.session_id, "assistant", full_response)
+        # Caching: Hämta max var 15:e minut
+        now = time.time()
+        if (now - last_garmin_fetch > 900) or (cached_garmin_data is None):
+            data = garmin_tool.get_health_report()
+            if data:
+                cached_garmin_data = data
+                last_garmin_fetch = now
+                print(">> Garmin-data hämtad.")
+            else:
+                print(">> Kunde inte hämta Garmin-data.")
+        
+        # Lägg till datan i system-prompten
+        if cached_garmin_data:
+            stats = cached_garmin_data
+            health_prompt = (
+                f"\n\n[HÄLSODATA FRÅN GARMIN - {stats['datum']}]:\n"
+                f"- Sömn: {stats['sömn_timmar']} timmar.\n"
+                f"- Vilopuls: {stats['vilopuls']} bpm.\n"
+                f"- Stressnivå (snitt): {stats['stress_snitt']}.\n"
+                f"- Steg idag: {stats['steg']}.\n"
+                f"- Senaste aktivitet: {stats['senaste_träning']}.\n"
+                f"Analysera datan. Ge korta, konkreta råd baserat på dagsformen."
+            )
+            system_context += health_prompt
 
-    return StreamingResponse(response_wrapper(), media_type="text/plain")
+    # 3. Bygg meddelandelistan till Gemini
+    gemini_messages = [{"role": "user", "parts": [system_context]}]
+    
+    for m in request.messages:
+        role = "user" if m.role == "user" else "model"
+        gemini_messages.append({"role": role, "parts": [m.content]})
+
+    # 4. Anropa Gemini
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(gemini_messages)
+        return response.text
+
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        return "Jag har lite problem med anslutningen till hjärnan just nu."
