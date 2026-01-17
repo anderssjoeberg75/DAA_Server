@@ -1,49 +1,42 @@
+"""
+app/tools/gcal_core.py
+"""
 import os
+import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from config.settings import get_config
 
 cfg = get_config()
-SERVICE_ACCOUNT_FILE = cfg["SERVICE_ACCOUNT_FILE"]
 
-def get_calendar_service():
-    """Authenticates and returns the Google Calendar service object."""
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        print(f"⚠️ Warning: Service account file not found at {SERVICE_ACCOUNT_FILE}")
-        return None
+def get_calendar_events(max_results=5):
+    """Hämtar kommande händelser i kalendern."""
+    key_path = cfg["SERVICE_ACCOUNT_FILE"]
+    if not os.path.exists(key_path): return "Ingen kalender-nyckel hittades."
 
     try:
         creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
-            scopes=['https://www.googleapis.com/auth/calendar']
-        )
-        return build('calendar', 'v3', credentials=creds)
+            key_path, scopes=['https://www.googleapis.com/auth/calendar.readonly'])
+        service = build('calendar', 'v3', credentials=creds)
+        
+        now = datetime.datetime.utcnow().isoformat() + 'Z'
+        events_result = service.events().list(calendarId='primary', timeMin=now,
+                                            maxResults=max_results, singleEvents=True,
+                                            orderBy='startTime').execute()
+        events = events_result.get('items', [])
+        
+        if not events: return "Kalendern är tom."
+        
+        output = "Kommande händelser: "
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            clean_time = start.replace('T', ' ').split('+')[0][:16]
+            output += f"Kl {clean_time}: {event.get('summary', 'Inget namn')}. "
+        return output
     except Exception as e:
-        print(f"⚠️ Error creating calendar service: {e}")
-        return None
+        return f"Kalenderfel: {e}"
 
-def create_calendar_event(summary, start_time, end_time, description=""):
-    """
-    Creates an event in the primary Google Calendar.
-    Args:
-        summary (str): Title of the event.
-        start_time (str): ISO format timestamp (e.g., '2023-10-01T10:00:00').
-        end_time (str): ISO format timestamp.
-        description (str): Optional notes.
-    """
-    service = get_calendar_service()
-    if not service:
-        return {"success": False, "error": "Calendar service unavailable"}
-
-    try:
-        event = {
-            'summary': summary,
-            'description': description,
-            'start': {'dateTime': start_time, 'timeZone': 'Europe/Stockholm'},
-            'end': {'dateTime': end_time, 'timeZone': 'Europe/Stockholm'},
-        }
-
-        created_event = service.events().insert(calendarId='primary', body=event).execute()
-        return {"success": True, "link": created_event.get('htmlLink')}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+def create_calendar_event(summary, start_time, end_time):
+    """Funktion för att skapa event (kräver skrivrättigheter i scope)."""
+    # Implementera vid behov
+    return "Funktionen är inte aktiverad i denna version."

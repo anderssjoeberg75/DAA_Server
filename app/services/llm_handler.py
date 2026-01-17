@@ -1,91 +1,64 @@
 import google.generativeai as genai
 import httpx
 import json
+import asyncio
 from config.settings import get_config
-
-# Import tools
-from app.tools.gcal_core import create_calendar_event
-from app.tools.z2m_core import get_sensor_data
+# [VIKTIGT 1] Importera control_light här:
+from app.tools import get_calendar_events, get_sensor_data, control_vacuum, get_ha_state, control_light
+from app.core.prompts import SYSTEM_PROMPT 
 
 cfg = get_config()
 
-# Configure Gemini
 if cfg["GOOGLE_API_KEY"]:
     genai.configure(api_key=cfg["GOOGLE_API_KEY"])
 
-# List of tools available to Gemini
-# The model will automatically decide when to call these functions.
-daa_tools = [create_calendar_event, get_sensor_data]
+# [VIKTIGT 2] Lägg till control_light i listan här!
+# Det är denna rad som ger AI:n "tillåtelse" att styra lampor.
+daa_tools = [get_calendar_events, get_sensor_data, control_vacuum, get_ha_state, control_light]
 
 async def stream_gemini(model_id, history, new_message, image_data=None):
-    """
-    Streams response from Gemini Cloud with vision support and Function Calling.
-    
-    Args:
-        model_id (str): The name of the Gemini model (e.g., 'gemini-1.5-flash').
-        history (list): List of previous messages.
-        new_message (str): The user's current input.
-        image_data (str, optional): Base64 encoded image data.
-    """
     try:
-        # Initialize the model with the toolset
-        model = genai.GenerativeModel(model_id, tools=daa_tools)
+        model = genai.GenerativeModel(
+            model_id, 
+            tools=daa_tools, 
+            system_instruction=SYSTEM_PROMPT
+        )
         
-        # Format history for Gemini API
         chat_history = []
         for msg in history:
             role = "user" if msg["role"] == "user" else "model"
-            parts = [msg["content"]]
-            chat_history.append({"role": role, "parts": parts})
+            chat_history.append({"role": role, "parts": [msg["content"]]})
 
-        # Start chat with automatic function calling enabled
-        # This allows Python to execute the requested function and return the result to Gemini
-        chat = model.start_chat(
-            history=chat_history,
-            enable_automatic_function_calling=True
-        )
+        # enable_automatic_function_calling=True gör att den kör control_light själv
+        chat = model.start_chat(history=chat_history, enable_automatic_function_calling=True)
         
-        # Prepare current message parts
-        current_parts = [new_message]
+        parts = [new_message]
         if image_data:
-            current_parts.append({
-                "mime_type": "image/jpeg",
-                "data": image_data
-            })
+            parts.append({"mime_type": "image/jpeg", "data": image_data})
 
-        # Send message and stream the response
-        response = await chat.send_message_async(current_parts, stream=True)
+        response = await chat.send_message_async(parts)
         
-        async for chunk in response:
-            if chunk.text:
-                yield chunk.text
+        if response.text:
+            yield response.text
 
     except Exception as e:
-        yield f"⚠️ Gemini Error: {str(e)}"
+        if "finish_reason" in str(e):
+             yield "Säkerhetsfilter stoppade svaret."
+        else:
+             yield f"⚠️ Gemini Error: {str(e)}"
 
 async def stream_ollama(model_id, history, new_message):
-    """Streams response from local Ollama instance (No tools supported yet)."""
     url = f"{cfg['OLLAMA_URL']}/api/chat"
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": new_message}]
     
-    # Format history for Ollama
-    messages = history + [{"role": "user", "content": new_message}]
-    
-    payload = {
-        "model": model_id,
-        "messages": messages,
-        "stream": True
-    }
-
     async with httpx.AsyncClient() as client:
         try:
-            async with client.stream("POST", url, json=payload, timeout=60.0) as response:
+            async with client.stream("POST", url, json={"model": model_id, "messages": messages}, timeout=60.0) as response:
                 async for line in response.aiter_lines():
                     if line:
                         try:
                             data = json.loads(line)
-                            if "message" in data and "content" in data["message"]:
-                                yield data["message"]["content"]
-                        except:
-                            continue
+                            if "message" in data: yield data["message"].get("content", "")
+                        except: continue
         except Exception as e:
-            yield f"⚠️ Ollama Error: {str(e)}"
+            yield f"⚠️ Ollama Error: {e}"
