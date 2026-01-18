@@ -6,52 +6,67 @@ import json
 import time
 from typing import List, Optional
 
-# --- HÄR KOPPLAR VI IHOP MED DIN SETTINGS.PY ---
+# Importera databasfunktioner
+from app.core.database import save_message, get_history
+# Importera System Prompt
+from app.core.prompts import get_system_prompt
+
+# Importera inställningar
 try:
     from config.settings import (
         GOOGLE_API_KEY, 
         OPENAI_API_KEY, 
         OLLAMA_URL, 
         GARMIN_EMAIL, 
-        GARMIN_PASSWORD
+        GARMIN_PASSWORD,
+        STRAVA_CLIENT_ID,
+        STRAVA_REFRESH_TOKEN
     )
 except ImportError:
-    print(">> VARNING: Kunde inte importera från config.settings")
     GOOGLE_API_KEY = None
     OPENAI_API_KEY = None
     OLLAMA_URL = "http://127.0.0.1:11434"
     GARMIN_EMAIL = None
     GARMIN_PASSWORD = None
+    STRAVA_CLIENT_ID = None
+    STRAVA_REFRESH_TOKEN = None
 
+# Verktyg
 from app.tools.garmin_core import GarminCoach
+from app.tools.strava_core import StravaTool
 
 router = APIRouter()
 
-# --- KONFIGURATION AV AI-TJÄNSTER ---
+# --- KONFIGURATION AV AI ---
 has_google = False
-if GOOGLE_API_KEY and len(str(GOOGLE_API_KEY)) > 10:
+if GOOGLE_API_KEY:
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
         has_google = True
-        print(">> Google API konfigurerat.")
-    except Exception as e:
-        print(f">> Google API Error: {e}")
-else:
-    print(">> VARNING: Ingen giltig Google API-nyckel hittades.")
+    except: pass
 
-# --- INITIERA VERKTYG (GARMIN) ---
+# --- GARMIN INIT ---
 garmin_tool = None
 if GARMIN_EMAIL and GARMIN_PASSWORD:
     try:
         garmin_tool = GarminCoach()
-        print(">> Garmin-verktyg initierat.")
-    except Exception as e:
-        print(f">> Kunde inte starta Garmin: {e}")
+    except: pass
 
 last_garmin_fetch = 0
 cached_garmin_data = None
 
-# --- DATAMODELLER ---
+# --- STRAVA INIT ---
+strava_tool = None
+if STRAVA_CLIENT_ID and STRAVA_REFRESH_TOKEN:
+    try:
+        strava_tool = StravaTool()
+    except: pass
+
+last_strava_fetch = 0
+cached_strava_data = None
+
+
+# --- MODELLER ---
 class Message(BaseModel):
     role: str
     content: str
@@ -60,32 +75,27 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     model: str = "gemini-1.5-flash"
     messages: List[Message]
-    session_id: Optional[str] = None
+    session_id: str = "default"
 
-# --- HÄMTA MODELLER ---
+# --- ENDPOINTS ---
+
 @router.get("/api/models")
 async def get_models():
+    """Hämtar tillgängliga modeller dynamiskt."""
     models = []
     
-    # 1. Google Gemini
+    # 1. Google
     if has_google:
-        print(">> Hämtar Google-modeller från API...")
         try:
             for m in genai.list_models():
                 if 'generateContent' in m.supported_generation_methods:
                     clean_id = m.name.replace("models/", "")
-                    d_name = getattr(m, "display_name", getattr(m, "displayName", clean_id))
-                    models.append({
-                        "id": clean_id, 
-                        "name": f"Google: {d_name} ({clean_id})"
-                    })
-        except Exception as e:
-            print(f">> Fel vid listning av Google-modeller: {e}")
-            models.append({"id": "gemini-1.5-flash", "name": "Google: Gemini 1.5 Flash (Fallback)"})
+                    d_name = getattr(m, "display_name", clean_id)
+                    models.append({"id": clean_id, "name": f"Google: {d_name}"})
+        except: pass
     
     # 2. OpenAI
     if OPENAI_API_KEY:
-        print(">> Hämtar OpenAI-modeller från API...")
         try:
             h = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
             r = requests.get("https://api.openai.com/v1/models", headers=h, timeout=5)
@@ -93,123 +103,154 @@ async def get_models():
                 data = r.json().get('data', [])
                 data.sort(key=lambda x: x.get('created', 0), reverse=True)
                 for m in data:
-                    mid = m['id']
-                    if "gpt" in mid or "o1" in mid:
-                        models.append({"id": mid, "name": f"OpenAI: {mid}"})
-        except Exception as e:
-            print(f">> OpenAI Error: {e}")
+                    if m['id'].startswith(("gpt", "o1")):
+                        models.append({"id": m['id'], "name": f"OpenAI: {m['id']}"})
+        except: pass
 
     # 3. Ollama
-    print(">> Hämtar Ollama-modeller...")
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
         if r.status_code == 200:
             for m in r.json().get('models', []):
                 models.append({"id": m['name'], "name": f"Ollama: {m['name']}"})
-    except Exception as e:
-        print(f">> Kunde inte nå Ollama: {e}")
+    except: pass
 
-    if not models:
-        models.append({"id": "error", "name": "Inga modeller hittades (Kolla loggen)"})
+    return {"data": models}
 
-    return {"object": "list", "data": models}
-
-# --- CHATT-LOGIK ---
 @router.post("/chat")
 @router.post("/api/chat")
 async def chat(request: ChatRequest):
     global last_garmin_fetch, cached_garmin_data
+    global last_strava_fetch, cached_strava_data
     
+    # 1. Hämta data
     user_msg = request.messages[-1].content
+    session_id = request.session_id
     model_id = request.model.lower()
-    
-    system_prompt = "Du är DAA, en smart assistent. Svara på svenska."
 
-    # --- GARMIN-DATA ---
-    triggers = ["puls", "sömn", "träning", "stress", "garmin", "mår jag", "status"]
-    if garmin_tool and any(t in user_msg.lower() for t in triggers):
+    # 2. SPARA ANVÄNDARENS MEDDELANDE
+    # Vi sparar fortfarande med session_id för ordningens skull, 
+    # men get_history hämtar nu allt.
+    save_message(session_id, "user", user_msg)
+
+    # 3. Hämta historik
+    # Nu utan 'limit=20', så den använder default från settings.py (oftast 600)
+    # Detta ger AI:n ett mycket längre minne.
+    db_history = get_history(session_id)
+
+    # 4. Hämta System Prompt
+    system_prompt = get_system_prompt()
+
+    # --- HÄMTA GARMIN-DATA ---
+    garmin_triggers = ["puls", "sömn", "stress", "garmin", "mår jag", "status", "kropp"]
+    if garmin_tool and any(t in user_msg.lower() for t in garmin_triggers):
         now = time.time()
         if (now - last_garmin_fetch > 900) or not cached_garmin_data:
-            print(">> Hämtar Garmin-data...")
             try:
                 report = garmin_tool.get_health_report()
                 if report:
                     cached_garmin_data = report
                     last_garmin_fetch = now
-            except Exception as e:
-                print(f">> Garmin Fetch Error: {e}")
+            except: pass
         
         if cached_garmin_data:
             d = cached_garmin_data
-            
             data_block = (
-                f"Sömn: {d.get('sömn_timmar')}h\n"
-                f"Vilopuls: {d.get('vilopuls')} bpm\n"
-                f"Stress: {d.get('stress_snitt')}/100\n"
-                f"Steg: {d.get('steg')}"
+                f"   - 💤 Sömn: {d.get('sömn_timmar')} timmar\n"
+                f"   - ❤️ Vilopuls: {d.get('vilopuls')} bpm\n"
+                f"   - ⚡ Stressnivå: {d.get('stress_snitt')}/100\n"
+                f"   - 🔋 Body Battery: {d.get('body_battery', 'N/A')}"
             )
+            system_prompt += f"\n\n[HÄLSODATA FRÅN GARMIN IDAG]:\n{data_block}\n\nINSTRUKTION: Analysera ovanstående data. Ge konkreta råd baserat på värdena."
 
-            # NY PROMPT: Långt svar, ren text, tydliga radbrytningar
-            system_prompt += (
-                f"\n\n[HÄLSODATA FRÅN GARMIN]\n"
-                f"{data_block}\n\n"
-                "INSTRUKTION FÖR RAPPORTEN:\n"
-                "Du ska agera som en professionell hälsocoach. Ge en utförlig, djupgående och omtänksam analys.\n"
-                "VIKTIGT OM FORMATERING:\n"
-                "1. Använd INTE Markdown-rubriker (###) eller fetstil (**text**). Skriv bara ren text.\n"
-                "2. Använd punktlistor (*) för mätvärdena så att de hamnar på nya rader.\n"
-                "3. Använd dubbla radbrytningar mellan stycken för att skapa luft i texten.\n\n"
-                "Följ denna struktur:\n"
-                "DAGENS STATUS\n"
-                "* (Lista värdena med emojis, en per rad)\n\n"
-                "ANALYS\n"
-                "(Skriv en lång och detaljerad analys i flera stycken om hur värdena hänger ihop. Förklara varför sömnen är viktig om den är låg.)\n\n"
-                "RÅD\n"
-                "1. (Konkret råd 1)\n"
-                "2. (Konkret råd 2)\n"
-                "3. (Konkret råd 3)"
-            )
+    # --- HÄMTA STRAVA-DATA ---
+    strava_triggers = ["strava", "löpning", "cykling", "pass", "träning", "aktivitet"]
+    if strava_tool and any(t in user_msg.lower() for t in strava_triggers):
+        now = time.time()
+        if (now - last_strava_fetch > 300) or not cached_strava_data:
+            try:
+                activities = strava_tool.get_health_report(limit=3)
+                if activities:
+                    cached_strava_data = activities
+                    last_strava_fetch = now
+            except: pass
 
-    # --- ROUTING ---
+        if cached_strava_data:
+            strava_text = ""
+            for act in cached_strava_data:
+                strava_text += (
+                    f"   - 📅 {act['datum']}: {act['typ']}\n"
+                    f"     Distans: {act['distans_km']} km | Tid: {act['tid_min']} min | Ansträngning: {act['ansträngning']}\n"
+                )
+            system_prompt += f"\n\n[SENASTE TRÄNINGSPASS]:\n{strava_text}\nINSTRUKTION: Kommentera träningen kortfattat och uppmuntrande."
+
+    response_text = ""
+
+    # 5. ANROPA AI
+    
+    # --- GOOGLE GEMINI ---
     if "gemini" in model_id:
         try:
-            msgs = [{"role": "user", "parts": [system_prompt]}]
-            for m in request.messages:
-                role = "user" if m.role == "user" else "model"
-                msgs.append({"role": role, "parts": [m.content]})
-            gmodel = genai.GenerativeModel(model_id)
-            return gmodel.generate_content(msgs).text
-        except Exception as e:
-            return f"Gemini Error: {e}"
+            gemini_history = []
+            gemini_history.append({"role": "user", "parts": [system_prompt]})
+            gemini_history.append({"role": "model", "parts": ["Uppfattat. Jag svarar strukturerat."]})\
 
+            for msg in db_history:
+                role = "model" if msg['role'] == "assistant" else "user"
+                gemini_history.append({"role": role, "parts": [msg['content']]})
+            
+            # Lägg till nuvarande meddelande om det inte hann sparas/hämtas
+            if not db_history or db_history[-1]['content'] != user_msg:
+                 gemini_history.append({"role": "user", "parts": [user_msg]})
+
+            gmodel = genai.GenerativeModel(model_id)
+            final_response = gmodel.generate_content(gemini_history)
+            response_text = final_response.text
+
+        except Exception as e:
+            response_text = f"Gemini Error: {e}"
+
+    # --- OPENAI / OTHERS ---
     elif "gpt" in model_id or "o1" in model_id:
         try:
-            payload = {
-                "model": model_id,
-                "messages": [{"role": "system", "content": system_prompt}] + 
-                            [{"role": m.role, "content": m.content} for m in request.messages]
-            }
+            messages = [{"role": "system", "content": system_prompt}]
+            for msg in db_history:
+                messages.append({"role": msg['role'], "content": msg['content']})
+            
+            if not db_history or db_history[-1]['content'] != user_msg:
+                 messages.append({"role": "user", "content": user_msg})
+
+            payload = {"model": model_id, "messages": messages}
             h = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
             r = requests.post("https://api.openai.com/v1/chat/completions", json=payload, headers=h)
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
+                response_text = r.json()["choices"][0]["message"]["content"]
             else:
-                return f"OpenAI Error {r.status_code}: {r.text}"
+                response_text = f"OpenAI Error: {r.text}"
         except Exception as e:
-            return f"OpenAI Connection Error: {e}"
+            response_text = f"Error: {e}"
 
+    # --- OLLAMA ---
     else:
         try:
-            payload = {
-                "model": model_id,
-                "messages": [{"role": "system", "content": system_prompt}] + 
-                            [{"role": m.role, "content": m.content} for m in request.messages],
-                "stream": False
-            }
+            messages = [{"role": "system", "content": system_prompt}]
+            for msg in db_history:
+                messages.append({"role": msg['role'], "content": msg['content']})
+            
+            if not db_history or db_history[-1]['content'] != user_msg:
+                 messages.append({"role": "user", "content": user_msg})
+
+            payload = {"model": model_id, "messages": messages, "stream": False}
             r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=60)
             if r.status_code == 200:
-                return r.json().get("message", {}).get("content", "")
+                response_text = r.json().get("message", {}).get("content", "")
             else:
-                return f"Ollama Error: {r.text}"
+                response_text = f"Ollama Error: {r.text}"
         except Exception as e:
-            return f"Ollama Connection Failed: {e}"
+            response_text = f"Error: {e}"
+
+    # 6. SPARA SVAR
+    if response_text:
+        save_message(session_id, "assistant", response_text)
+
+    return response_text
